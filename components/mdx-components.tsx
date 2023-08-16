@@ -1,8 +1,10 @@
 import Image from "next/image"
+import IconAndText from "@/components/IconAndText"
 import { useMDXComponent } from "next-contentlayer/hooks"
 
 const components = {
   Image,
+  IconAndText
 }
 
 interface MdxProps {
