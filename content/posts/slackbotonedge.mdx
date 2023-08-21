@@ -1,0 +1,386 @@
+---
+title:  "Living on the Slackbot Vercel Edge"
+date: "2023-08-21"
+---
+
+While there are some examples of how to setup a slackbot that runs on Lambdas, there wasn't much available for running in an edge environment. 
+
+The Edge Runtime has a few limitations (or differences) - not the least of which is that they often are not using the Node APIs. Rather they will often use v8 directly and make available the Fetch API.  
+
+When using the app directory, API routes will run in this reduced environment which left me having to implement a new Slack Bolt Receiver.  
+
+The example below takes into account this difference by using the `next-connect` library's support for NextJS's edge runtime.
+
+## The receiver
+
+The Bolt library allows you to create a [custom receiver](https://slack.dev/bolt-js/concepts#receiver).  We can store the Bolt app object in the init call and we use that to process the request.  The way it typically works is that the receiver does the work of interpreting the request and packaging the responses.  This is particularly helpful here because the edge router, as mentioned earlier, uses the Fetch API and not the Node `https` APIs.  
+
+In the solution below we use the fantastic [`next-connect`](https://github.com/hoangvvo/next-connect#nextjs-edge-api-routes) library to setup our handlers in the edge runtime.  
+
+### First, we instatiate an edge router
+
+```typescript
+// SETUP THE ROUTER - note taht we use NextConnect's EdgeRouter
+//  to handle the routing for us.  This uses the fetch API to 
+//  handle requests and responses.
+this.router = createEdgeRouter<Request, RequestContext>()
+
+// ADD ALL THE ENDPOINT HANDLERS - We pass on all the routes
+//  that are going to be handled by the Bolt app to the router
+Object.values(endpoints).forEach((endpoint) => {
+    this.router.post(endpoint, this.requestHandler.bind(this))
+})
+```
+
+Then we create a request handler that will do the following:
+
+### Handle URL url_verification
+
+```typescript
+if (body?.type === 'url_verification') {
+    return new Response(
+        JSON.stringify({ challenge: body?.challenge }),
+        { status: 200 }
+    )
+}
+```
+
+### Handle signature validation
+
+```typescript
+if (!this.validateSignature(req)) {            
+    return new Response('', { status: 401 })
+}
+```
+
+(see below for implementation of validateSignature)
+
+### Process incoming events
+
+```typescript
+await this.bolt?.processEvent(event)
+```
+
+### Accept and send acknlowdgement responses
+
+```typescript
+if (storedResponse !== undefined) {
+    this.logger.debug('stored response sent')
+    return new Response(storedResponse, {
+        status: 200,
+        headers: {
+            'content-type': 'application/json',
+        },
+    })
+}
+
+return new Response('', { status: 200 })
+```
+
+## Everything Put Together
+
+```typescript
+import crypto from 'crypto'
+import tsscmp from 'tsscmp'
+import { Logger, ConsoleLogger, LogLevel } from '@slack/logger'
+import { createEdgeRouter } from 'next-connect'
+import App from '@slack/bolt/dist/App'
+import {
+    ReceiverMultipleAckError,
+    ErrorCode,
+    CodedError,
+} from '@slack/bolt/dist/errors'
+import {
+    Receiver,
+    ReceiverEvent,
+} from '@slack/bolt/dist/types'
+import { StringIndexed } from '@slack/bolt/dist/types/helpers'
+import { RequestContext } from 'next/dist/server/base-server'
+import { EdgeRouter } from 'next-connect/dist/types/edge'
+
+/**
+ * Returns the value of a header on a request, or undefined if it's not present.
+ * @param request The incoming request
+ * @param headerName The name of the header to retrieve
+ * @returns The value of the header, or undefined if it's not present
+ */
+function getRequestHeader(
+    request: Request,
+    headerName: string
+): string | undefined {
+    const headerValue = request.headers.get(headerName)
+    if (headerValue === null) {
+        return undefined
+    }
+    return headerValue
+}
+
+/**
+ *  Returns the value of a header on a request, parsed as a number, or undefined if it's not present.
+ * @param request The incoming request
+ * @param headerName The name of the header to retrieve
+ * @returns The value of the header, parsed as a number, or undefined if it's not present
+ */
+function getRequestHeaderAsNumber(
+    request: Request,
+    headerName: string
+): number | undefined {
+    const headerValue = getRequestHeader(request, headerName)
+    if (headerValue === undefined) {
+        return undefined
+    }
+    return Number(headerValue)
+}
+
+export interface AppRouterBoltReceiverOptions {
+    signingSecret: string
+    logger?: Logger
+    logLevel?: LogLevel
+    endpoints?: string | { [endpointType: string]: string }
+    customPropertiesExtractor?: (request: Request) => StringIndexed
+}
+
+/**
+ * Receives HTTP requests with Events, Slash Commands, and Actions. Works with
+ * the Next App Router version of the NextJS framework.  Unlike other receivers,
+ * this one is meant to handle requests and responses that use the Fetch API.
+ */
+export class AppRouterBoltReceiver implements Receiver {
+    private bolt: App | undefined
+
+    private logger: Logger
+
+    private signingSecret: string
+
+    public router: EdgeRouter<Request, RequestContext>
+
+    private customPropertiesExtractor: (request: Request) => StringIndexed
+
+    public constructor({
+        logger = undefined,
+        logLevel = LogLevel.INFO,
+        signingSecret,
+        endpoints = {
+            events: '/api/slack/events',
+            commands: '/api/slack/commands',
+            actions: '/api/slack/actions',
+            options: '/api/slack/options',
+        },
+        customPropertiesExtractor = (_req) => ({}),
+    }: AppRouterBoltReceiverOptions) {
+
+        this.signingSecret = signingSecret
+
+        // SETUP THE LOGGER
+        if (typeof logger !== 'undefined') {
+            this.logger = logger
+        } else {
+            this.logger = new ConsoleLogger()
+            this.logger.setLevel(logLevel)
+        }
+
+        // SETUP THE ROUTER - note taht we use NextConnect's EdgeRouter
+        //  to handle the routing for us.  This uses the fetch API to 
+        //  handle requests and responses.
+        this.router = createEdgeRouter<Request, RequestContext>()
+
+        // ADD ALL THE ENDPOINT HANDLERS - We pass on all the routes
+        //  that are going to be handled by the Bolt app to the router
+        Object.values(endpoints).forEach((endpoint) => {
+            this.router.post(endpoint, this.requestHandler.bind(this))
+        })
+
+        this.customPropertiesExtractor = customPropertiesExtractor
+    }
+
+    /**
+     *  Validates the signature of the request basedd on a stored signing secret.  It will
+     * return true if the signature is valid, false if it is not.  It will also check the 
+     * timestamp of the request to ensure that it is not too old.
+     * @param req 
+     * @returns 
+     */
+    private async validateSignature(req: Request) {
+        const body = await req.clone().text()
+        const signature = getRequestHeader(req, 'X-Slack-Signature')
+        const requestTimestamp = getRequestHeaderAsNumber(req, 'X-Slack-Request-Timestamp')
+
+        if (!signature || !requestTimestamp) {
+            return false;
+        }
+    
+        // Divide current date to match Slack ts format
+        // Subtract 5 minutes from current time
+        const fiveMinutesAgo = Math.floor(Date.now() / 1000) - 60 * 5;
+        if (requestTimestamp < fiveMinutesAgo) {
+            this.logger.info(`Request timed out: ${requestTimestamp})`)
+            return false
+        }
+    
+        const hmac = crypto.createHmac('sha256', this.signingSecret);
+        const [version, hash] = signature.split('=');
+        hmac.update(`${version}:${requestTimestamp}:${body}`);
+        if (!tsscmp(hash, hmac.digest('hex'))) {
+            this.logger.info(`Invalid request signature detected (X-Slack-Signature: ${signature}, X-Slack-Request-Timestamp: ${requestTimestamp})`);    
+            return false;
+        }
+
+        return true
+    }
+
+    /**
+     * Handles the parsing of the body of the request.  This is a bit more complex than
+     * it should be because Slack sends the body as a URL encoded form, but the body
+     * is actually a JSON object.  So we have to parse the body as a URL encoded form
+     * and then parse the payload property of the body as JSON.
+     * 
+     * In some cases the body is just a JSON object, so we have to handle that as well.
+     * 
+     * @param req 
+     * @returns 
+     */
+    private async parseRequestBody(req: Request): Promise<any> {
+        const rawBody = await req.clone().text()
+        const contentType = getRequestHeader(req, 'content-type')
+        if (contentType === 'application/x-www-form-urlencoded') {
+            const parsedBody = new URLSearchParams(rawBody)
+            const body: StringIndexed = {}
+            parsedBody.forEach((value, key) => {
+                body[key] = value
+            })
+            
+            if (body.payload !== undefined) {
+                return JSON.parse(body.payload)
+            }
+
+            return body
+        }
+        if (contentType === 'application/json') {
+            return JSON.parse(rawBody)
+        }
+        return rawBody
+    }
+
+    /**
+     * This is the main request handler for the Bolt app.  It will handle all the
+     * incoming requests and route them to the appropriate handler.
+     * 
+     * @param req 
+     * @returns 
+     */
+    private async requestHandler(req: Request): Promise<any> {
+        const body = await this.parseRequestBody(req)
+
+        if (body?.ssl_check) {
+            return new Response('', { status: 200 })
+        }
+
+        // VALIDATE SIGNATURE
+        if (body?.type === 'url_verification') {
+            return new Response(
+                JSON.stringify({ challenge: body?.challenge }),
+                { status: 200 }
+            )
+        }
+
+        // VALIDATE SIGNATURE
+        if (!this.validateSignature(req)) {            
+            return new Response('', { status: 401 })
+        }
+
+        let isAcknowledged = false
+        setTimeout(() => {
+            if (!isAcknowledged) {
+                this.logger.error(
+                    'An incoming event was not acknowledged within 3 seconds. Ensure that the ack() argument is called in a listener.'
+                )
+            }
+        }, 3001)
+
+        let storedResponse
+        const event: ReceiverEvent = {
+            body,
+            ack: async (response: string): Promise<void> => {
+                this.logger.debug('ack() begin')
+                if (isAcknowledged) {
+                    throw new ReceiverMultipleAckError()
+                }
+                isAcknowledged = true
+                if (typeof response === 'undefined' || response === null) {
+                    storedResponse = ''
+                } else if (typeof response === 'string') {
+                    storedResponse = response
+                } else if (typeof response === 'object') {
+                    storedResponse = JSON.stringify(response)
+                }
+                
+                this.logger.debug('ack() response sent')
+            },
+            retryNum: getRequestHeaderAsNumber(req, 'x-slack-retry-num'),
+            retryReason: getRequestHeader(req, 'x-slack-retry-reason'),
+            customProperties: this.customPropertiesExtractor(req),
+        }
+
+        try {
+            if (event.retryNum && event.retryReason === 'http_timeout') {
+                this.logger.debug('Ignoring retry due to http timeout')
+                return
+            }
+            await this.bolt?.processEvent(event)
+            if (storedResponse !== undefined) {
+                this.logger.debug('stored response sent')
+                return new Response(storedResponse, {
+                    status: 200,
+                    headers: {
+                        'content-type': 'application/json',
+                    },
+                })
+            }
+
+            return new Response('', { status: 200 })
+
+        } catch (err) {
+            const e = err as any
+            if ('code' in e) {
+                // CodedError has code: string
+                const errorCode = (err as CodedError).code
+                if (errorCode === ErrorCode.AuthorizationError) {
+                    // authorize function threw an exception, which means there is no valid installation data
+                    isAcknowledged = true
+                    return new Response(
+                        'No valid authorization found for this installation.',
+                        {
+                            status: 401,
+                        }
+                    )
+                }
+            }
+            return new Response((err as Error).message, { status: 500 })
+        }
+    }
+
+    /**
+     *  Initializes the Bolt app with the receiver.
+     * @param bolt 
+     */
+    public init(bolt: App): void {
+        this.bolt = bolt
+    }
+
+    /**
+     * Starts the router.
+     * @returns 
+     */
+    public start(): any {
+        return this.router
+    }
+
+    /**
+     * Stops the router.
+     * @returns 
+     */
+    public stop(): Promise<void> {
+        return Promise.resolve()
+    }
+}
+```
