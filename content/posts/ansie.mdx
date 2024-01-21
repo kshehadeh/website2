@@ -1,0 +1,38 @@
+---
+title:  "Ansie"
+date: "2024-01-21"
+---
+
+
+[*Ansie*](https://www.npmjs.com/package/ansie) is a rich-text terminal rendering package that uses html-like markup instead of complicated terminal codes to generate its output.  
+
+I started this package out of frustration of not having a relatively simple way to output rich text without relying on direct terminal codes which is difficult to parse with the human eye.  Yes, there is *chalk* but I was hoping to have something that would allow for easily updating the look and feel without imperative programming required.  *Ink* is neat but it relies on a heavy-handed approach for layout (it uses a rust-based layout engine for determining the layout of flexboxes - super cool, but not what I wanted).
+
+With Ansie, there are no dependencies for the library - not even chalk.  It uses PEGJS to build a parser that will read an xml-based string and translate that into terminal codes. 
+
+For example:
+
+```html
+    <h1 bold marginBottom="1">My Console App</h1>
+    <h2 fg="gray" marginBottom="1">A little something I wrote</h2>
+    <p marginBottom="1">
+        In order to used this app, do the following:
+        <li bullet="*" marginBottom="1"> Create a config file</li>
+        <li bullet="*" marginBottom="1"> Run the utility with the -h flag</li>
+        <li bullet="*" marginBottom="1"> etc...</li>
+    </p>
+```
+
+This feels better to me, as a web developer than the same thing written out with terminal codes:
+
+```bash
+^[[1mMy Console App^[[22m
+^[[90mA little something I wrote^[[39m
+
+In order to used this app, do the following:
+*  Create a config file
+*  Run the utility with the -h flag
+*  etc...
+```
+
+As I play with the grammar and the compilation I'm learning a lot about the intricacies of parsing and rendering a declarative langauge like HTML.  Decisions like whether to make the language more terse and sacrifice consistency is a big one.  Another one is what to do with the "space between" declarations.  Do you interpret them as-is (e.g. space and newlines) or do you force the user to explicitly define them.  In the end, I have a feeling this will be an option, but the decision is one I'm sure was made a long time ago in the HTML realm: be explicit unless you use the `<pre>`.  Another interesting option that I will probably add in the near future.
