@@ -4,9 +4,9 @@ date: "2024-01-21"
 ---
 
 
-[*Ansie*](https://www.npmjs.com/package/ansie) is a rich-text terminal rendering package that uses html-like markup instead of complicated terminal codes to generate its output.  
+Ansie is a rich-text terminal rendering package that uses html-like markup instead of complicated terminal codes to generate its output.  
 
-I started this package out of frustration of not having a relatively simple way to output rich text without relying on direct terminal codes which is difficult to parse with the human eye.  Yes, there is *chalk* but I was hoping to have something that would allow for easily updating the look and feel without imperative programming required.  *Ink* is neat but it relies on a heavy-handed approach for layout (it uses a rust-based layout engine for determining the layout of flexboxes - super cool, but not what I wanted).
+I started [this package](https://www.npmjs.com/package/ansie) out of frustration of not having a relatively simple way to output rich text without relying on direct terminal codes which is difficult to parse with the human eye.  Yes, there is *chalk* but I was hoping to have something that would allow for easily updating the look and feel without imperative programming required.  *Ink* is neat but it relies on a heavy-handed approach for layout (it uses a rust-based layout engine for determining the layout of flexboxes - super cool, but not what I wanted).
 
 With Ansie, there are no dependencies for the library - not even chalk.  It uses PEGJS to build a parser that will read an xml-based string and translate that into terminal codes. 
 
